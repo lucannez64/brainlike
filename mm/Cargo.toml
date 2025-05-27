@@ -1,0 +1,27 @@
+[package]
+name = "mm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nalgebra = "0.29"
+ndarray = "0.15"
+ndarray-rand = "0.14"
+indicatif = "0.17"
+plotters = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-pickle = "0.6"
+csv = "1.1"
+# Use rust-gpu from GitHub since it's not published on crates.io
+wgpu = "0.12"
+glam = "0.23"
+rand = "0.8"
+
+[build-dependencies]
+
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
