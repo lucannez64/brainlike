@@ -465,6 +465,79 @@ impl DeepLearner7 {
         serde_json::to_writer_pretty(file, &ws)?;
         Ok(())
     }
+
+    /// Load saved weights for DeepLearner7 from JSON file
+    pub fn load_weights(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::open(path)?;
+        let ws: Weights7 = serde_json::from_reader(file)?;
+        // restore hidden layer parameters
+        for (i, w_mat) in ws.hidden_ws.iter().enumerate() {
+            self.weights[i] = Array2::from_shape_vec((w_mat.len(), w_mat[0].len()), w_mat.concat())?;
+            self.biases[i]  = Array1::from_vec(ws.hidden_bs[i].clone());
+        }
+        // restore outputs
+        self.w_out_reg = Array2::from_shape_vec((ws.w_out_reg.len(), ws.w_out_reg[0].len()), ws.w_out_reg.concat())?;
+        self.b_out_reg = Array1::from_vec(ws.b_out_reg);
+        self.w_out_clf = Array2::from_shape_vec((ws.w_out_clf.len(), ws.w_out_clf[0].len()), ws.w_out_clf.concat())?;
+        self.b_out_clf = Array1::from_vec(ws.b_out_clf);
+        Ok(())
+    }
+}
+
+/// A network of pretrained DeepLearner7 neurons connected in configurable layers
+pub struct BioNetwork {
+    layers: Vec<Vec<DeepLearner7>>,  
+    synapses: Vec<Array2<f32>>, // weights between layers
+}
+
+impl BioNetwork {
+    /// Build a new BioNetwork with given layer sizes. Each neuron is a DeepLearner7 initialized and optionally loaded from weights.
+    pub fn new(
+        layer_sizes: &[usize],
+        hidden_sizes: &[usize;7],
+        num_reg: usize,
+        num_clf: usize,
+        neuron_lr: f32,
+        conn_lr: f32,
+    ) -> Self {
+        let mut layers = Vec::new();
+        for &size in layer_sizes.iter() {
+            let mut layer = Vec::new();
+            for _ in 0..size {
+                // initialize each neuron model
+                let neuron = DeepLearner7::new(layer_sizes[0], hidden_sizes, num_reg, num_clf, neuron_lr);
+                layer.push(neuron);
+            }
+            layers.push(layer);
+        }
+        // initialize synaptic weights between consecutive layers
+        let mut synapses = Vec::new();
+        for w in layer_sizes.windows(2) {
+            let (in_dim, out_dim) = (w[0], w[1]);
+            let mat = Array2::random_using((in_dim, out_dim), Uniform::new(-0.1, 0.1), &mut thread_rng());
+            synapses.push(mat);
+        }
+        BioNetwork { layers, synapses }
+    }
+
+    /// Forward propagate an input vector through the network, returns final layer activations
+    pub fn forward(&self, input: &Array1<f32>) -> Array1<f32> {
+        let mut activations = input.clone();
+        for (layer, conn) in self.layers.iter().zip(self.synapses.iter()) {
+            // weighted sum for next layer inputs
+            let next_input = activations.dot(conn);
+            // neuron outputs
+            let mut next_act = Array1::<f32>::zeros(layer.len());
+            for (i, neuron) in layer.iter().enumerate() {
+                // DNN expects 2D array: single sample
+                let sample = next_input.slice(s![i..=i]).to_owned().insert_axis(ndarray::Axis(0));
+                let (out_reg, _) = neuron.predict(&sample);
+                next_act[i] = out_reg[[0, 0]];
+            }
+            activations = next_act;
+        }
+        activations
+    }
 }
 
 /// Print results stub

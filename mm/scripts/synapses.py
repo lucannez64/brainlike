@@ -1,4 +1,3 @@
-
 import brian2 as b2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,11 +6,13 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
+import json
+import os  # for caching generated dataset
 
 # Brian2 Simulation Parameters
 b2.defaultclock.dt = 0.1 * b2.ms  # Simulation time step
 DURATION = 200 * b2.ms          # Duration of each simulation run
-N_SAMPLES = 1000                # Number of data samples to generate
+N_SAMPLES = 10000                # Number of data samples to generate
 SEQUENCE_LENGTH = int(DURATION / b2.defaultclock.dt) # Timesteps per sample
 
 tau_rec = 200 * b2.ms
@@ -86,7 +87,7 @@ def generate_synaptic_data(n_samples, seq_len, actual_dt):
         state_mon = b2.StateMonitor(S, ['g_total', 'x', 'u', 'g_pulse'], record=True, dt=actual_dt)
 
         net = b2.Network(spike_gen, G, S, state_mon)
-        net.run(DURATION, report='text') # report=None can speed it up slightly for many runs
+        net.run(DURATION, report=None)  # report=None can speed it up slightly for many runs
 
         all_input_spikes[i, :] = input_spike_train.astype(float)
         recorded_g = state_mon.g_total[0]
@@ -98,15 +99,21 @@ def generate_synaptic_data(n_samples, seq_len, actual_dt):
 
     return all_input_spikes, all_output_conductances
 
-# Generate data
-print("Generating training data with Brian2...")
-# Use a smaller dt for Brian2 simulation for accuracy, then potentially downsample for CNN
-# Or ensure CNN sequence length matches Brian2 steps
-actual_dt_for_generation = b2.defaultclock.dt # This has units, e.g., 0.1*ms
-print(f"Using actual_dt_for_generation: {actual_dt_for_generation}")
-input_spikes, output_conductances = generate_synaptic_data(
-    N_SAMPLES, SEQUENCE_LENGTH, actual_dt_for_generation
-)
+# Cache Brian2-generated data to avoid regeneration every run
+data_file = 'synapse_data.npz'
+actual_dt_for_generation = b2.defaultclock.dt  # Brian2 dt with units
+if os.path.exists(data_file):
+    print(f"Loading cached synapse data from {data_file}...")
+    data = np.load(data_file)
+    input_spikes, output_conductances = data['X'], data['y']
+else:
+    print("Generating training data with Brian2...")
+    print(f"Using actual_dt_for_generation: {actual_dt_for_generation}")
+    input_spikes, output_conductances = generate_synaptic_data(
+        N_SAMPLES, SEQUENCE_LENGTH, actual_dt_for_generation
+    )
+    print(f"Saving generated data to {data_file}...")
+    np.savez(data_file, X=input_spikes, y=output_conductances)
 print(f"Input spikes shape: {input_spikes.shape}")
 print(f"Output conductances shape: {output_conductances.shape}")
 
@@ -140,7 +147,14 @@ ax1.set_xlabel(f'Time (ms), dt={b2.defaultclock.dt / b2.ms:.2f} ms')
 ax1.set_ylabel('Input Spikes', color=color)
 # Plot spikes as stems
 spike_times_plot = np.where(X[sample_idx, :, 0] > 0.5)[0] * (b2.defaultclock.dt / b2.ms)
-ax1.stem(spike_times_plot, np.ones_like(spike_times_plot), linefmt=color+'-', markerfmt=color+'o', basefmt=" ")
+if spike_times_plot.size > 0:
+    markerline, stemlines, baseline = ax1.stem(
+        spike_times_plot,
+        np.ones_like(spike_times_plot),
+        linefmt='-', markerfmt='o', basefmt=" "
+    )
+    plt.setp(markerline, color=color)
+    plt.setp(stemlines, color=color)
 ax1.tick_params(axis='y', labelcolor=color)
 ax1.set_ylim(0, 1.5)
 
@@ -155,152 +169,236 @@ plt.title(f"Sample Brian2 Synapse Input/Output (Sample {sample_idx})")
 plt.show()
 
 
-def build_cnn_model(input_shape, num_conv_layers=2, filters=32, kernel_size=5):
-    """Builds a 1D CNN model for sequence-to-sequence prediction."""
-    model = keras.Sequential()
+# Define callbacks for training
+early_stopping = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+reduce_lr = keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)
+
+# --- Deep Feedforward Network (MLP) ---
+# Prepare input shape for DNN: flatten sequence dimension
+input_shape = (SEQUENCE_LENGTH, 1)
+
+def build_dnn_model(input_shape, hidden_layers=[512,256,128], dropout=0.5, l2_reg=1e-4):
+    model = keras.Sequential(name="DNN_" + "x".join(map(str, hidden_layers)))
     model.add(layers.Input(shape=input_shape))
-
-    # Convolutional layers
-    for i in range(num_conv_layers):
-        model.add(layers.Conv1D(
-            filters=filters * (i + 1), # Increasing filters
-            kernel_size=kernel_size,
-            activation='relu',
-            padding='same' # 'causal' for strict step-by-step prediction
+    model.add(layers.Flatten())
+    for units in hidden_layers:
+        model.add(layers.Dense(
+            units,
+            activation='elu',  # smoother activation
+            kernel_regularizer=keras.regularizers.l2(l2_reg)
         ))
-        # Optional: BatchNormalization, Dropout, MaxPooling1D
         model.add(layers.BatchNormalization())
-        if i < num_conv_layers -1 : # No pooling after last conv before output usually
-             model.add(layers.MaxPooling1D(pool_size=2, padding='same'))
-
-
-    # Output layer: We want an output of the same sequence length
-    # A Conv1D layer with 1 filter can achieve this.
-    # Or, if pooling reduced dimensionality too much, you might need UpSampling1D
-    # or ensure pooling is compatible with desired output length.
-    # If MaxPooling was used, the sequence length is reduced.
-    # We need to ensure the output layer can produce the original sequence length.
-    # For simplicity, if pooling is used, we might need to adjust.
-    # Let's try a final Conv1D to map to the output channels.
-    # If MaxPooling was used, the spatial dimension is halved each time.
-    # We need to be careful here. Let's make pooling optional or adjust.
-
-    # To ensure output is same length as input when using 'same' padding and no striding
-    # in conv, and if pooling is used, we need to upsample or use a different strategy.
-    # For now, let's assume we want to predict the full sequence.
-    # If MaxPooling was used, we need to upsample back.
-    # Example: if 1 maxpool layer with pool_size=2, we need UpSampling1D(2)
-    
-    # Let's try a model structure that maintains sequence length or reconstructs it
-    # For simplicity, let's try a few Conv1D layers and then a final Conv1D for output.
-    # If using MaxPooling, you'd typically have Dense layers or an RNN at the end,
-    # or use UpSampling. For seq-to-seq with CNNs, often an encoder-decoder
-    # structure or fully convolutional networks are used.
-
-    # Simpler approach for now: Conv layers with 'same' padding, no pooling,
-    # then a final Conv1D for output.
-    
-    # Re-thinking the simple CNN structure for seq-to-seq:
-    model_s2s = keras.Sequential(name=f"CNN_{num_conv_layers}_layers")
-    model_s2s.add(layers.Input(shape=input_shape))
-    for _ in range(num_conv_layers):
-        model_s2s.add(layers.Conv1D(filters, kernel_size, activation='relu', padding='same'))
-        model_s2s.add(layers.BatchNormalization()) # Good practice
-    # Final Conv1D to map to the single output feature (conductance) at each time step
-    model_s2s.add(layers.Conv1D(1, kernel_size=1, activation='linear', padding='same')) # Linear for regression
-
-    model_s2s.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001), loss='mse')
-    model_s2s.summary()
-    return model_s2s
-
-# --- Experiment with number of layers ---
-# Minimal could be 1 Conv1D layer + Output Conv1D layer
-# Let's try with 2 hidden Conv1D layers first.
-# The input_shape for Conv1D is (sequence_length, num_features_per_step)
-cnn_input_shape = (SEQUENCE_LENGTH, 1)
-
-# Try different numbers of layers
-results = {}
-
-for num_layers_exp in [1, 2, 3]: # Number of hidden Conv1D layers
-    print(f"\n--- Training CNN with {num_layers_exp} hidden Conv1D layer(s) ---")
-    model = build_cnn_model(cnn_input_shape, num_conv_layers=num_layers_exp, filters=32, kernel_size=7)
-
-    # Callbacks
-    early_stopping = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    reduce_lr = keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)
-
-    history = model.fit(
-        X_train, y_train,
-        epochs=50, # Adjust as needed
-        batch_size=32,
-        validation_data=(X_test, y_test),
-        callbacks=[early_stopping, reduce_lr],
-        verbose=1
+        model.add(layers.Dropout(dropout))
+    # final output to full sequence length
+    seq_len = input_shape[0]
+    model.add(layers.Dense(seq_len, activation='linear'))
+    model.compile(
+        optimizer=keras.optimizers.Nadam(learning_rate=0.0003),
+        loss=keras.losses.Huber(),
     )
-    
-    loss = model.evaluate(X_test, y_test, verbose=0)
-    results[num_layers_exp] = {'loss': loss, 'model': model, 'history': history.history}
-    print(f"Test MSE for {num_layers_exp} hidden layer(s): {loss:.6f}")
+    model.summary()
+    return model
 
-# Find best model based on test loss
-best_num_layers = min(results, key=lambda k: results[k]['loss'])
-best_model = results[best_num_layers]['model']
-best_loss = results[best_num_layers]['loss']
-print(f"\nBest model has {best_num_layers} hidden layer(s) with Test MSE: {best_loss:.6f}")
+# Train and evaluate DNN models
+results = {}
+for layers_cfg in [
+# [1024,512,256,128,64],
+]:
+     key = f"DNN_{'_'.join(map(str,layers_cfg))}"
+     print(f"\nTraining {key}")
+     model = build_dnn_model(input_shape, hidden_layers=layers_cfg)
+     history = model.fit(
+         X_train, y_train.reshape(-1, X_train.shape[1]),
+         epochs=500, batch_size=32,  # increased epochs for deeper training
+         validation_data=(X_test, y_test.reshape(-1, X_test.shape[1])),
+         callbacks=[early_stopping, reduce_lr],
+         verbose=1
+     )
+     loss = model.evaluate(X_test, y_test.reshape(-1, X_test.shape[1]), verbose=0)
+     results[key] = {'loss': loss, 'model': model, 'history': history.history}
+     print(f"Test MSE for {key}: {loss:.6f}")
 
+# Select best DNN
+best_model_key = min(results, key=lambda k: results[k]['loss'])
+best_model = results[best_model_key]['model']
+best_loss = results[best_model_key]['loss']
+print(f"\nBest model: {best_model_key} with MSE: {best_loss:.6f}")
 
-# --- Plot training history for the best model ---
-plt.figure(figsize=(10, 4))
-plt.plot(results[best_num_layers]['history']['loss'], label='Train Loss')
-plt.plot(results[best_num_layers]['history']['val_loss'], label='Validation Loss')
-plt.title(f'Model Loss (Best: {best_num_layers} hidden layers)')
-plt.ylabel('Loss (MSE)')
-plt.xlabel('Epoch')
-plt.legend()
-plt.show()
-
-
-# --- Visualize Predictions of the best model ---
+# Visualize predictions of best DNN
 n_vis_samples = 3
 for i in range(n_vis_samples):
-    sample_idx_test = np.random.randint(0, X_test.shape[0])
-    input_sample = X_test[sample_idx_test:sample_idx_test+1]
-    true_output_scaled = y_test[sample_idx_test]
-    
-    predicted_output_scaled = best_model.predict(input_sample)[0]
-
-    # Inverse transform to original scale for interpretation
-    true_output_original = scaler_y.inverse_transform(true_output_scaled)
-    predicted_output_original = scaler_y.inverse_transform(predicted_output_scaled)
-    
+    sample_idx = np.random.randint(0, X_test.shape[0])
+    input_sample = X_test[sample_idx:sample_idx+1]
+    true_scaled = y_test[sample_idx]
+    pred_scaled = best_model.predict(input_sample)[0]
+    true_orig = scaler_y.inverse_transform(true_scaled.reshape(-1,1))
+    pred_orig = scaler_y.inverse_transform(pred_scaled.reshape(-1,1))
     time_axis = np.arange(SEQUENCE_LENGTH) * (b2.defaultclock.dt / b2.ms)
-
-    fig, ax1 = plt.subplots(figsize=(15, 7))
-    
-    # Plot input spikes
-    color = 'tab:red'
-    ax1.set_xlabel(f'Time (ms), dt={b2.defaultclock.dt / b2.ms:.2f} ms')
+    fig, ax1 = plt.subplots(figsize=(15,7))
+    color='tab:red'
+    ax1.set_xlabel(f'Time (ms), dt={b2.defaultclock.dt/b2.ms:.2f} ms')
     ax1.set_ylabel('Input Spikes', color=color)
-    spike_times_plot = np.where(input_sample[0, :, 0] > 0.5)[0] * (b2.defaultclock.dt / b2.ms)
-    if len(spike_times_plot) > 0:
-        ax1.stem(spike_times_plot, np.ones_like(spike_times_plot), linefmt=color+'-', markerfmt=color+'o', basefmt=" ")
-    else: # Plot a flat line if no spikes, so ylim is consistent
-        ax1.plot([time_axis[0], time_axis[-1]], [0,0], color=color, alpha=0) # Invisible line for ylim
-    ax1.tick_params(axis='y', labelcolor=color)
-    ax1.set_ylim(-0.1, 1.5) # Adjusted for stem plot base
+    spikes = np.where(input_sample[0,:,0]>0.5)[0]*(b2.defaultclock.dt/b2.ms)
+    if spikes.size>0:
+        marker, stems, base = ax1.stem(spikes, np.ones_like(spikes), linefmt='-', markerfmt='o', basefmt=' ')
+        plt.setp(marker, color=color); plt.setp(stems, color=color)
+    ax1.tick_params(axis='y', labelcolor=color); ax1.set_ylim(-0.1,1.5)
+    ax2 = ax1.twinx(); col2='tab:blue'
+    ax2.set_ylabel('Conductance', color=col2)
+    ax2.plot(time_axis, true_orig[:,0], color=col2); ax2.plot(time_axis, pred_orig[:,0], color='tab:green')
+    plt.title(f"Prediction vs True ({best_model_key}) Sample {sample_idx}")
+    fig.tight_layout(); plt.show()
 
-    # Plot conductances
-    ax2 = ax1.twinx()
-    color_true = 'tab:blue'
-    color_pred = 'tab:green'
-    
-    ax2.set_ylabel('Synaptic Conductance (Original Scale)', color=color_true)
-    ax2.plot(time_axis, true_output_original[:, 0], color=color_true, linestyle='-', label='Brian2 (True)')
-    ax2.plot(time_axis, predicted_output_original[:, 0], color=color_pred, linestyle='--', label=f'CNN Prediction ({best_num_layers} layers)')
-    ax2.tick_params(axis='y', labelcolor=color_true)
-    
-    fig.legend(loc="upper right", bbox_to_anchor=(1,1), bbox_transform=ax1.transAxes)
-    plt.title(f"Comparison on Test Sample {sample_idx_test} (Original Scale)")
-    fig.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust layout to make space for legend
-    plt.show()
+# After selecting the best model, export its weights to JSON for Rust integration
+# Export model weights
+best_weights = {}
+for idx, layer in enumerate(best_model.layers):
+    if hasattr(layer, 'kernel'):
+        w, b = layer.get_weights()
+        best_weights[f"layer_{idx}_kernel"] = w.tolist()
+        best_weights[f"layer_{idx}_bias"] = b.tolist()
+
+def save_weights_to_json(weights, path):
+    with open(path, 'w') as f:
+        json.dump(weights, f)
+    print(f"Saved DNN weights to {path}")
+
+save_weights_to_json(best_weights, 'dnn_weights.json')
+
+# === Spike Function Approximation Section ===
+# Use existing keras and layers imports; set K alias
+K = keras.backend
+
+# Define target rectangular spike for training approximators
+def spike_target(x, width=0.005, height=1.0):
+    y = np.zeros_like(x)
+    y[np.abs(x) <= width] = height
+    return y
+
+# 1) Difference-of-sigmoids model
+def build_sigmoid_diff_model(k=100.0, b=0.005, A=1.0):
+    def diff_sigmoid(x):
+        return A*(1/(1+K.exp(-k*(x+b))) - 1/(1+K.exp(-k*(x-b))))
+    m = keras.Sequential([
+        layers.InputLayer(input_shape=(1,)),
+        layers.Lambda(diff_sigmoid)
+    ])
+    m.compile(optimizer='adam', loss='mse')
+    return m
+
+# 2) ReLU-based MLP
+def build_relu_mlp():
+    m = keras.Sequential([
+        layers.InputLayer(input_shape=(1,)),
+        layers.Dense(64, activation='relu', kernel_initializer='he_normal', use_bias=False),
+        layers.Dense(64, activation='relu', kernel_initializer='he_normal', use_bias=False),
+        layers.Dense(1, activation='linear')
+    ])
+    m.compile(optimizer='adam', loss='mse')
+    return m
+
+# 3) Custom Gaussian activation
+def build_custom_gaussian(sigma=0.005, mu=0.0, A=1.0):
+    def gauss(x): return A*K.exp(-K.square(x-mu)/(2*K.square(sigma)))
+    m = keras.Sequential([
+        layers.InputLayer(input_shape=(1,)),
+        layers.Lambda(gauss)
+    ])
+    m.compile(optimizer='adam', loss='mse')
+    return m
+
+# 4) Simple RNN transient model
+def build_rnn_model():
+    # Sequence-to-sequence RNN for synaptic conductance prediction
+    m = keras.Sequential([
+        layers.InputLayer(input_shape=(SEQUENCE_LENGTH,1)),
+        layers.SimpleRNN(32, activation='tanh', return_sequences=True),
+        layers.TimeDistributed(layers.Dense(1, activation='linear'))
+    ])
+    m.compile(optimizer='adam', loss='mse')
+    return m
+
+# --- Synapse Dataset Approximation with Multiple Architectures ---
+approximator_builders = {
+    'ReLU_MLP_Seq': lambda: _build_seq_relu_mlp(),
+}
+def _build_seq_diff_sigmoid_model(k=100.0, b=0.005, A=1.0):
+    inp = layers.Input(shape=(SEQUENCE_LENGTH,1))
+    out = layers.Lambda(lambda x: A*(1/(1+K.exp(-k*(x+b))) - 1/(1+K.exp(-k*(x-b)))))(inp)
+    m = keras.Model(inputs=inp, outputs=out)
+    m.compile(optimizer='adam', loss='mse')
+    return m
+def _build_seq_custom_gaussian(sigma=0.005, mu=0.0, A=1.0):
+    inp = layers.Input(shape=(SEQUENCE_LENGTH,1))
+    out = layers.Lambda(lambda x: A*K.exp(-K.square(x-mu)/(2*K.square(sigma))))(inp)
+    m = keras.Model(inputs=inp, outputs=out)
+    m.compile(optimizer='adam', loss='mse')
+    return m
+def _build_seq_relu_mlp():
+    m = keras.Sequential(name='ReLU_MLP_Seq')
+    m.add(layers.Input(shape=(SEQUENCE_LENGTH,1)))
+    m.add(layers.Flatten())
+    m.add(layers.Dense(64, activation='relu', kernel_regularizer=keras.regularizers.l2(1e-4)))
+    m.add(layers.Dense(64, activation='relu', kernel_regularizer=keras.regularizers.l2(1e-4)))
+    m.add(layers.Dense(SEQUENCE_LENGTH, activation='linear'))
+    m.add(layers.Reshape((SEQUENCE_LENGTH,1)))
+    m.compile(optimizer=keras.optimizers.Nadam(learning_rate=0.00003), loss=keras.losses.Huber())
+    return m
+
+approx_results = {}
+for name, builder in approximator_builders.items():
+    print(f"\nTraining {name} on synapse data")
+    model = builder()
+    if name == 'RNN_Seq':
+        history = model.fit(
+            X_train, y_train,
+            epochs=100, batch_size=32,
+            validation_data=(X_test, y_test), callbacks=[early_stopping, reduce_lr], verbose=1
+        )
+    else:
+        history = model.fit(
+            X_train, y_train,
+            epochs=10000, batch_size=64,
+            validation_data=(X_test, y_test), callbacks=[early_stopping, reduce_lr], verbose=1
+        )
+    loss = model.evaluate(X_test, y_test, verbose=0)
+    approx_results[name] = {'loss': loss, 'model': model, 'history': history.history}
+    print(f"Test loss for {name}: {loss:.6f}")
+print("\nAll approximators trained on synapse dataset. Summary:")
+for name, r in approx_results.items():
+    print(f"  {name}: {r['loss']:.6f}")
+
+# Visualize predictions for each approximator
+n_vis_samples = 10
+for name, info in approx_results.items():
+    model = info['model']
+    print(f"\nPlotting predictions for {name}")
+    for i in range(n_vis_samples):
+        sample_idx = np.random.randint(0, X_test.shape[0])
+        input_sample = X_test[sample_idx:sample_idx+1]
+        true_scaled = y_test[sample_idx]
+        # predict sequence
+        pred_seq = model.predict(input_sample)
+        # reshape to (SEQUENCE_LENGTH, 1)
+        pred_scaled = pred_seq.reshape(SEQUENCE_LENGTH, 1)
+        # inverse transform
+        true_orig = scaler_y.inverse_transform(true_scaled.reshape(-1,1))
+        pred_orig = scaler_y.inverse_transform(pred_scaled)
+        time_axis = np.arange(SEQUENCE_LENGTH) * (b2.defaultclock.dt / b2.ms)
+        # plot
+        fig, ax1 = plt.subplots(figsize=(15,7))
+        ax1.set_xlabel(f'Time (ms), dt={b2.defaultclock.dt/b2.ms:.2f} ms')
+        ax1.set_ylabel('Input Spikes', color='tab:red')
+        spikes = np.where(input_sample[0,:,0]>0.5)[0]*(b2.defaultclock.dt/b2.ms)
+        if spikes.size>0:
+            marker, stems, base = ax1.stem(spikes, np.ones_like(spikes), linefmt='-', markerfmt='o', basefmt=' ')
+            plt.setp(marker, color='tab:red'); plt.setp(stems, color='tab:red')
+        ax1.tick_params(axis='y', labelcolor='tab:red'); ax1.set_ylim(-0.1,1.5)
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Conductance', color='tab:blue')
+        ax2.plot(time_axis, true_orig[:,0], color='tab:blue', label='True')
+        ax2.plot(time_axis, pred_orig[:,0], color='tab:green', linestyle='--', label='Predicted')
+        plt.title(f"{name} Prediction vs True (Sample {sample_idx})")
+        fig.tight_layout(); plt.legend(); plt.show()
+
+
